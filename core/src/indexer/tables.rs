@@ -4727,7 +4727,7 @@ fn collect_journal_values(
         let mut where_clauses: Vec<String> = Vec::new();
         for col in &where_keys {
             if let Some(v) = row.columns.get(col.as_str()) {
-                where_clauses.push(format!("{}={}", col, format_wrapper_for_sql(v)));
+                where_clauses.push(format!("{}={}", col, format_wrapper_for_where_key(v)));
             }
         }
         if where_clauses.is_empty() {
@@ -4860,6 +4860,24 @@ async fn journal_non_reversible_ops_clickhouse(
 }
 
 /// Format an EthereumSqlTypeWrapper as a SQL literal for WHERE clauses.
+/// Renders a WHERE value for the journal `where_key` exactly as the reorg recalculation
+/// rebuilds it from the table (`col::TEXT` in Postgres, `toString(col)` in ClickHouse),
+/// so text values go in without the SQL quotes `format_wrapper_for_sql` adds.
+fn format_wrapper_for_where_key(w: &EthereumSqlTypeWrapper) -> String {
+    match w {
+        EthereumSqlTypeWrapper::Address(a) | EthereumSqlTypeWrapper::AddressNullable(a) => {
+            format!("{:#x}", a)
+        }
+        EthereumSqlTypeWrapper::String(s)
+        | EthereumSqlTypeWrapper::StringVarchar(s)
+        | EthereumSqlTypeWrapper::StringChar(s)
+        | EthereumSqlTypeWrapper::StringNullable(s)
+        | EthereumSqlTypeWrapper::StringVarcharNullable(s)
+        | EthereumSqlTypeWrapper::StringCharNullable(s) => s.clone(),
+        other => format_wrapper_for_sql(other),
+    }
+}
+
 fn format_wrapper_for_sql(w: &EthereumSqlTypeWrapper) -> String {
     match w {
         EthereumSqlTypeWrapper::String(s) => format!("'{}'", s.replace('\'', "''")),
@@ -4898,6 +4916,43 @@ fn format_wrapper_for_sql(w: &EthereumSqlTypeWrapper) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The reorg recalculation matches `where_key` against `'col=' || col::TEXT`, so the
+    // journal must store values unquoted; see test_reorg_journal_*_recalculation in e2e_reorg.
+    #[test]
+    fn journal_where_key_matches_reorg_recalculation_format() {
+        let operation: TableOperation = serde_yaml::from_str(
+            "type: upsert\n\
+             where:\n  pool_address: $rindexer_contract_address\n  label: $label\n  fee: $fee\n\
+             set:\n  - column: amount0\n    action: set\n    value: $amount0\n",
+        )
+        .unwrap();
+        let columns = HashMap::from([
+            (
+                "pool_address".to_string(),
+                EthereumSqlTypeWrapper::Address(
+                    "0x88E6A0c2dDD26FEEb64F039a2c41296FcB3f5640".parse().unwrap(),
+                ),
+            ),
+            ("label".to_string(), EthereumSqlTypeWrapper::String("o'neil".to_string())),
+            ("fee".to_string(), EthereumSqlTypeWrapper::U32(500)),
+            (
+                "amount0".to_string(),
+                EthereumSqlTypeWrapper::I256Numeric(I256::try_from(-5i64).unwrap()),
+            ),
+            ("rindexer_block_number".to_string(), EthereumSqlTypeWrapper::U64BigInt(100)),
+        ]);
+        let rows = vec![TableRowData { columns, network: "ethereum".to_string() }];
+
+        let sql = build_journal_sql("s.last_swap", &operation, &rows).unwrap();
+
+        assert!(
+            sql.contains(
+                "'fee=500,label=o''neil,pool_address=0x88e6a0c2ddd26feeb64f039a2c41296fcb3f5640'"
+            ),
+            "{sql}"
+        );
+    }
 
     #[test]
     fn format_wrapper_for_sql_renders_numeric_wrappers_as_numbers() {

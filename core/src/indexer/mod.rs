@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 
 pub mod cron_scheduler;
 mod dependency;
+#[cfg(test)]
+mod reorg_journal_tests;
 pub mod tables;
 #[cfg(test)]
 mod tables_atomic_tests;

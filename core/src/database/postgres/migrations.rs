@@ -1,5 +1,6 @@
 use crate::database::generate::{
-    generate_indexer_contract_schema_name, GenerateTablesForIndexerSqlError,
+    generate_indexer_contract_schema_name, generate_table_full_name,
+    GenerateTablesForIndexerSqlError,
 };
 use crate::helpers::camel_to_snake;
 use crate::indexer::Indexer;
@@ -15,31 +16,69 @@ use std::path::Path;
 pub enum Migration {
     /// Add `block_timestamp` column to all tables, nullable by default.
     V1,
+    /// Rewrite reorg journal keys of the indexer's custom tables from the quoted format
+    /// (`pool_address='0x..'`) to the unquoted one the reorg recalculation matches.
+    V2,
 }
 
 impl Migration {
-    pub const ALL: &'static [Migration] = &[Migration::V1];
+    pub const ALL: &'static [Migration] = &[Migration::V1, Migration::V2];
 
     pub fn as_u32(&self) -> u32 {
         match self {
             Migration::V1 => 1,
+            Migration::V2 => 2,
         }
     }
 
     pub fn from_u32(v: u32) -> Option<Self> {
         match v {
             1 => Some(Migration::V1),
+            2 => Some(Migration::V2),
             _ => None,
         }
     }
 
+    /// SQL for one raw event table; empty for migrations that do not touch event tables.
     pub fn generate_table_migration_sql(&self, table_name: &str) -> String {
         match self {
             Migration::V1 => {
                 format!("ALTER TABLE {table_name} ADD COLUMN IF NOT EXISTS block_timestamp TIMESTAMPTZ;")
             }
+            Migration::V2 => String::new(),
         }
     }
+
+    /// SQL for one custom (derived) table; empty for migrations that do not touch them.
+    pub fn generate_derived_table_migration_sql(&self, derived_table: &str) -> String {
+        match self {
+            Migration::V1 => String::new(),
+            Migration::V2 => unquote_journal_where_keys_sql(derived_table),
+        }
+    }
+}
+
+/// Matches one quoted `col='value'` segment of an old-format `where_key`; `bytes` values
+/// (`'\x..'`) are excluded because the writer still journals them quoted.
+const QUOTED_WHERE_SEGMENT: &str = r"(^|,)([A-Za-z0-9_]+)='(?!\\x)((?:[^']|'')*)'(?=,|$)";
+
+/// Strips the SQL quotes the journal writer used to put around `address` and `string`
+/// values in `where_key` and undoes their `''` escaping, e.g.
+/// `label='o''neil',pool_address='0x..'` -> `label=o'neil,pool_address=0x..`.
+///
+/// Only rows with a quoted segment are touched. In such a row every string value is
+/// quoted, so a `''` inside it is always an escape. The migration runs once per indexer,
+/// before indexing starts, so none of these tables has a new-format row yet, and it is
+/// scoped to the indexer's own tables because `derived_op_log` is shared.
+fn unquote_journal_where_keys_sql(derived_table: &str) -> String {
+    let quote = |s: &str| s.replace('\'', "''");
+    let pattern = quote(QUOTED_WHERE_SEGMENT);
+    format!(
+        "UPDATE rindexer_internal.derived_op_log \
+         SET where_key = replace(regexp_replace(where_key, '{pattern}', '\\1\\2=\\3', 'g'), '''''', '''') \
+         WHERE derived_table = '{table}' AND where_key ~ '{pattern}';",
+        table = quote(derived_table),
+    )
 }
 
 /// Execute any unapplied migrations for rindexer project.
@@ -100,6 +139,16 @@ pub async fn execute_migrations_for_indexer_sql(
             for event_info in raw_events {
                 let table_name = format!("{}.{}", schema_name, camel_to_snake(&event_info.name));
                 statements.push_str(&version.generate_table_migration_sql(&table_name));
+            }
+
+            for table in contract.tables.iter().flatten() {
+                let derived_table = generate_table_full_name(
+                    &indexer.name,
+                    &contract_name,
+                    &table.name,
+                    table.database.as_deref(),
+                );
+                statements.push_str(&version.generate_derived_table_migration_sql(&derived_table));
             }
         }
     }

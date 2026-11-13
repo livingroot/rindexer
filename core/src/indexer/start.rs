@@ -572,7 +572,7 @@ fn event_source_column_types(
 /// trace events so both sources contribute to reorg rollback.
 // Keep the two output maps explicit instead of wrapping them in a behaviorless type.
 #[allow(clippy::too_many_arguments)]
-fn build_derived_tables_for_event(
+pub(crate) fn build_derived_tables_for_event(
     event_name: &str,
     indexer_name: &str,
     contract_name: &str,
